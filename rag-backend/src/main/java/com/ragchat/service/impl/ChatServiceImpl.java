@@ -24,13 +24,14 @@ public class ChatServiceImpl implements ChatService {
     private final ProjectRepository projectRepository;
     private final RagPipelineClient ragClient;
 
-    // ── Fetch message history ──────────────────────────────────
+    /** Number of recent messages to pass as history to RAG pipeline */
+    private static final int HISTORY_WINDOW = 6;
+
+    // ── Fetch message history ──────────────────────────────────────────
 
     @Override
     public List<MessageResponse> getMessages(String userId, String projectId) {
-        // Verify ownership
         verifyProjectOwnership(userId, projectId);
-
         return messageRepository
                 .findByProjectIdAndUserIdOrderByTimestampAsc(projectId, userId)
                 .stream()
@@ -38,15 +39,14 @@ public class ChatServiceImpl implements ChatService {
                 .collect(Collectors.toList());
     }
 
-    // ── Send message ───────────────────────────────────────────
+    // ── Send message ───────────────────────────────────────────────────
 
     @Override
     public MessageResponse sendMessage(String userId, String projectId, String userMessage) {
         Project project = projectRepository.findByIdAndUserId(projectId, userId)
-                .orElseThrow(() -> new ResourceNotFoundException(
-                        "Project not found: " + projectId));
+                .orElseThrow(() -> new ResourceNotFoundException("Project not found: " + projectId));
 
-        // 1. Persist the user's message
+        // 1. Persist the user's message first
         Message userMsg = Message.builder()
                 .projectId(projectId)
                 .userId(userId)
@@ -55,18 +55,30 @@ public class ChatServiceImpl implements ChatService {
                 .build();
         messageRepository.save(userMsg);
 
-        // 2. Query the RAG pipeline for an AI response
-        String aiAnswer;
-        try {
-            aiAnswer = ragClient.query(projectId, userMessage);
-        } catch (Exception e) {
-            // Pipeline not set up — return a placeholder response
-            log.warn("RAG pipeline unavailable for project [{}], using fallback", projectId);
-            aiAnswer = "I received your message, but the AI pipeline is not yet connected. "
-                    + "Once your Python RAG service is running, I'll be able to answer based on your context.";
+        // 2. Fetch recent history to send as context to RAG pipeline
+        //    (exclude the just-saved user message — we send it as "question")
+        List<Message> history = messageRepository
+                .findByProjectIdAndUserIdOrderByTimestampAsc(projectId, userId)
+                .stream()
+                .filter(m -> !m.getId().equals(userMsg.getId()))   // exclude current question
+                .collect(Collectors.toList());
+
+        // Trim to last HISTORY_WINDOW messages
+        if (history.size() > HISTORY_WINDOW) {
+            history = history.subList(history.size() - HISTORY_WINDOW, history.size());
         }
 
-        // 3. Persist the assistant's response
+        // 3. Query the RAG pipeline with history context
+        String aiAnswer;
+        try {
+            aiAnswer = ragClient.query(projectId, userMessage, history);
+        } catch (Exception e) {
+            log.warn("[{}] RAG pipeline unavailable, using fallback response: {}", projectId, e.getMessage());
+            aiAnswer = "I received your message, but the AI pipeline is not yet connected. "
+                    + "Once the Python RAG service is running, I'll answer based on your uploaded context.";
+        }
+
+        // 4. Persist the assistant's response
         Message assistantMsg = Message.builder()
                 .projectId(projectId)
                 .userId(userId)
@@ -75,16 +87,17 @@ public class ChatServiceImpl implements ChatService {
                 .build();
         messageRepository.save(assistantMsg);
 
-        // 4. Update the project's lastMessage preview (truncated to 100 chars)
+        // 5. Update dashboard preview (last message shown on project card)
         project.setLastMessage(userMessage.length() > 100
                 ? userMessage.substring(0, 97) + "..."
                 : userMessage);
         projectRepository.save(project);
 
+        log.info("[{}] Message exchange complete for user [{}]", projectId, userId);
         return toResponse(assistantMsg);
     }
 
-    // ── Helpers ────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────
 
     private void verifyProjectOwnership(String userId, String projectId) {
         if (!projectRepository.existsByIdAndUserId(projectId, userId)) {
