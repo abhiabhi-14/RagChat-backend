@@ -1,0 +1,4 @@
+target/
+.env
+*.env
+application-prod.properties
